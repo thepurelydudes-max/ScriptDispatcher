@@ -1,0 +1,32 @@
+name: Windows EXE Build
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Build Windows portable
+        run: python -m PyInstaller --noconfirm --clean ScriptDispatcherBuild.spec
+      - name: Check executable
+        shell: pwsh
+        run: |
+          if (!(Test-Path 'dist/ScriptDispatcher/ScriptDispatcher.exe')) { throw 'EXE missing' }
+      - name: Upload build (does not contain user data or secrets)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScriptDispatcher-Windows-x64
+          path: dist/ScriptDispatcher/
+          if-no-files-found: error

@@ -1,0 +1,32 @@
+# Python and virtual envs
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Build artifacts
+build/
+dist/
+*.spec.bak
+
+# User state and credentials: NEVER commit
+/data/
+/cash/
+/private/*
+!/private/README.md
+/dispatcher/private_defaults.local.py
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.log
+*.bak
+*.tmp
+*.env
+.env.*
+*.pfx
+*.pem
+*.key
+*.token
