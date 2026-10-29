@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -50,6 +51,24 @@ class HistoryFixture:
 
 
 class HistoryStoreTests(HistoryFixture, unittest.TestCase):
+    def test_connection_context_commits_and_closes_even_while_referenced(self):
+        run_id = self.add_run(message="before")
+        with self.store._connect() as db:
+            db.execute("UPDATE runs SET message=? WHERE id=?", ("committed", run_id))
+        self.assertEqual(self.store.last_for_task("a").message, "committed")
+        with self.assertRaises(sqlite3.ProgrammingError):
+            db.execute("SELECT 1")
+
+    def test_connection_context_rolls_back_and_closes_after_an_exception(self):
+        run_id = self.add_run(message="original")
+        with self.assertRaisesRegex(RuntimeError, "abort transaction"):
+            with self.store._connect() as db:
+                db.execute("UPDATE runs SET message=? WHERE id=?", ("discarded", run_id))
+                raise RuntimeError("abort transaction")
+        self.assertEqual(self.store.last_for_task("a").message, "original")
+        with self.assertRaises(sqlite3.ProgrammingError):
+            db.execute("SELECT 1")
+
     def test_task_and_status_filters_apply_before_limit_and_bind_literal_input(self):
         task_id = "selected' OR 1=1 --"
         first = self.add_run(task_id, status="error")
@@ -191,7 +210,8 @@ class HistoryDialogTests(HistoryFixture, unittest.TestCase):
             opener.assert_not_called()
             dialog.open_log_button.click()
             opener.assert_called_once()
-            self.assertEqual(opener.call_args.args[0].toLocalFile(), str(path))
+            opened_path = Path(opener.call_args.args[0].toLocalFile())
+            self.assertEqual(opened_path.resolve(), path.resolve())
 
     def test_network_or_url_log_paths_are_not_opened(self):
         for path in ("https://example.invalid/log", r"\\server\private\run.log", "//server/private/run.log"):

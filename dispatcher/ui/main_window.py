@@ -76,6 +76,28 @@ class StatusDelegate(QStyledItemDelegate):
         style.drawControl(QStyle.ControlElement.CE_ItemViewItem, view, painter, view.widget)
 
 
+class TimestampItem(QTableWidgetItem):
+    """Keep localized dates readable while sorting by their actual time."""
+
+    def __lt__(self, other):
+        key = self.data(Qt.ItemDataRole.UserRole + 1)
+        other_key = other.data(Qt.ItemDataRole.UserRole + 1)
+        return (key if key is not None else float("inf")) < (other_key if other_key is not None else float("inf"))
+
+
+def timestamp_key(value, timezone: str | None = None) -> float:
+    try:
+        moment = datetime.fromisoformat(value) if isinstance(value, str) else value
+        if moment.tzinfo is None and timezone is not None:
+            try:
+                moment = moment.replace(tzinfo=ZoneInfo(timezone))
+            except (ValueError, KeyError):
+                pass
+        return moment.timestamp()
+    except (AttributeError, ValueError, TypeError, OverflowError, OSError):
+        return float("inf")
+
+
 class MainWindow(QMainWindow):
     def __init__(
         self,
@@ -505,7 +527,11 @@ class MainWindow(QMainWindow):
                 ]
                 self.table.insertRow(row)
                 for column, value in enumerate(values):
-                    item = QTableWidgetItem(value)
+                    item = TimestampItem(value) if column in (5, 6) else QTableWidgetItem(value)
+                    if column == 5:
+                        item.setData(Qt.ItemDataRole.UserRole + 1, timestamp_key(last.finished_at or last.started_at) if last else float("inf"))
+                    elif column == 6:
+                        item.setData(Qt.ItemDataRole.UserRole + 1, timestamp_key(upcoming, str(self.config.settings.get("timezone", "Europe/Moscow"))) if task.enabled else float("inf"))
                     if column == 0:
                         item.setData(Qt.ItemDataRole.UserRole, task.id)
                     if column == 4:
@@ -956,6 +982,7 @@ class MainWindow(QMainWindow):
             if not task:
                 continue
             upcoming = next_run(task.schedule, now) if task.enabled else None
+            next_item.setData(Qt.ItemDataRole.UserRole + 1, timestamp_key(upcoming, str(self.config.settings.get("timezone", "Europe/Moscow"))))
             next_item.setText(self._format_dt(upcoming))
             # The scheduler checks every 10s. Refresh status here too, so a
             # task that succeeded yesterday becomes Waiting after midnight.

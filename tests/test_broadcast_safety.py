@@ -60,7 +60,10 @@ class BroadcastRenameTests(unittest.TestCase):
                 ])
                 self.assertTrue(all(path.is_file() for path in paths))
                 self.assertEqual([path.read_bytes() for path in paths], [b"A", b"B"])
-                self.assertEqual(set((root / "out").iterdir()), set(paths))
+                self.assertEqual(
+                    {path.resolve() for path in (root / "out").iterdir()},
+                    {path.resolve() for path in paths},
+                )
 
     def test_shifted_name_chain_preserves_every_fragment(self):
         with tempfile.TemporaryDirectory() as temporary:

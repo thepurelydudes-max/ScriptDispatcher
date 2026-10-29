@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 from dispatcher.history import HistoryStore
 from dispatcher.models import TaskDefinition
+from dispatcher.modules.common import TaskContext
+from dispatcher.modules.web_tools import run_make_links
 from dispatcher.task_runner import TaskRunner
 
 
@@ -231,7 +233,7 @@ class TaskPathTests(unittest.TestCase):
             except OSError as exc:
                 self.skipTest(f"symlinks unavailable: {exc}")
             task = TaskDefinition(id="alias", name="Alias", module="music.list_mp3", params={"source_dir": str(alias)})
-            self.assertEqual(task_resource_paths(task), {os.path.normcase(str(source))})
+            self.assertEqual(task_resource_paths(task), {os.path.normcase(str(source.resolve()))})
 
     def test_symlink_parent_segments_reserve_the_module_actual_directory(self):
         _inputs, _outputs, task_resource_paths = self.path_helpers()
@@ -249,7 +251,29 @@ class TaskPathTests(unittest.TestCase):
                 id="alias", name="Alias", module="yandex.make_links",
                 params={"input_file": str(alias / ".." / "names.txt")},
             )
-            self.assertEqual(task_resource_paths(task), {os.path.normcase(str(source))})
+            # Path.resolve handles a symlink followed by ".." differently on
+            # Windows and POSIX. Exercise the module's real IO so its reserved
+            # directory must match the one it actually reads and writes.
+            (root / "names.txt").write_text("Root Fixture\n", encoding="utf-8")
+            (source / "names.txt").write_text("Library Fixture\n", encoding="utf-8")
+            context = TaskContext(
+                task=task, settings={}, secrets={}, run_dir=root / "run",
+                cancel_event=threading.Event(), log=lambda _message: None,
+                progress=lambda _value, _message: None,
+            )
+            result = run_make_links(context)
+            self.assertEqual(len(result["files"]), 1)
+            output = Path(result["files"][0])
+            expected_contents = {
+                root.resolve(): b"https://music.yandex.ru/search?text=Root%20Fixture",
+                source.resolve(): b"https://music.yandex.ru/search?text=Library%20Fixture",
+            }
+            self.assertIn(output.parent, expected_contents)
+            self.assertEqual(output.read_bytes(), expected_contents[output.parent])
+            self.assertEqual(
+                sum((folder / "ссылки на песни.txt").is_file() for folder in (root, source)), 1,
+            )
+            self.assertEqual(task_resource_paths(task), {os.path.normcase(str(output.parent.resolve()))})
 
     def test_nested_sources_are_paths_but_names_and_lists_are_not(self):
         task = TaskDefinition(
@@ -288,7 +312,7 @@ class TaskPathTests(unittest.TestCase):
                 params={"input_file": "library/../library/names.txt", "output_file": "links.txt"},
             )
             resources = TaskRunner._task_resources(task)
-            self.assertEqual(resources, {os.path.normcase(str(root)), os.path.normcase(str(folder))})
+            self.assertEqual(resources, {os.path.normcase(str(root.resolve())), os.path.normcase(str(folder.resolve()))})
 
     def test_source_relative_output_defaults_use_the_source_folder(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -299,7 +323,7 @@ class TaskPathTests(unittest.TestCase):
             )
             self.assertEqual(
                 TaskRunner._task_resources(task),
-                {os.path.normcase(str(root / "work")), os.path.normcase(str(root / "library"))},
+                {os.path.normcase(str((root / "work").resolve())), os.path.normcase(str((root / "library").resolve()))},
             )
 
 

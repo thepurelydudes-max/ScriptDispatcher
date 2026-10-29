@@ -166,6 +166,16 @@ class InterfaceOptimizationTests(unittest.TestCase):
         self.assertTrue(state.is_file())
         self.assertFalse((self.root / "data" / "config.json").exists(), "View-only changes must not rewrite tasks")
 
+    def test_last_run_sort_uses_time_instead_of_day_first_display_text(self):
+        for task_id, stamp in (("a", "2026-10-31T12:00:00+03:00"), ("b", "2026-11-01T12:00:00+03:00")):
+            run_id = self.history.start(task_id, task_id, "")
+            with self.history._connect() as db:
+                db.execute("UPDATE runs SET started_at=?,finished_at=?,status='success' WHERE id=?", (stamp, stamp, run_id))
+        window = self.window()
+        window.table.setSortingEnabled(True)
+        window.table.sortItems(5, Qt.SortOrder.AscendingOrder)
+        self.assertEqual(window.table.item(0, 0).data(Qt.ItemDataRole.UserRole), "a")
+
 
 if __name__ == "__main__":
     unittest.main()
