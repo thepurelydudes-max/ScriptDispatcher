@@ -1,16 +1,16 @@
 from __future__ import annotations
 
+import codecs
 import os
-import queue
 import shlex
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 from urllib.parse import quote
 
 from .common import TaskContext, resolve_path
+from ..process_tree import OwnedProcessTree, read_pipe_available
 
 
 def _relative_file(value: str, workdir: str) -> Path:
@@ -87,56 +87,49 @@ def run_external(ctx: TaskContext):
         command = [str(program), *arguments]
     ctx.log("Запуск: " + subprocess.list2cmdline(command))
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-    process = subprocess.Popen(
-        command,
-        cwd=workdir,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        creationflags=creationflags,
-    )
-    output_queue: queue.Queue[str | None] = queue.Queue()
-
-    def read_output():
-        try:
-            if process.stdout:
-                for output_line in process.stdout:
-                    output_queue.put(output_line.rstrip())
-        finally:
-            output_queue.put(None)
-
-    reader = threading.Thread(target=read_output, daemon=True)
-    reader.start()
-    started = time.monotonic()
     timeout = max(0, int(params.get("timeout", 0)))
-    reader_finished = False
+    tree = OwnedProcessTree()
+    process = None
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    pending = ""
     try:
+        ctx.check_cancelled()
+        process = tree.popen(
+            command,
+            cwd=workdir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            creationflags=creationflags,
+        )
+        started = time.monotonic()
         while True:
-            if ctx.cancel_event.is_set():
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                ctx.check_cancelled()
+            ctx.check_cancelled()
             if timeout and time.monotonic() - started > timeout:
-                process.terminate()
                 raise TimeoutError(f"Превышен тайм-аут {timeout} секунд")
-            try:
-                line = output_queue.get(timeout=0.1)
-                if line is None:
-                    reader_finished = True
-                elif line:
-                    ctx.log(line)
-            except queue.Empty:
-                pass
-            if process.poll() is not None and reader_finished:
+            exited = process.poll() is not None
+            output = read_pipe_available(process.stdout)
+            if output:
+                pending += decoder.decode(output)
+                lines = pending.split("\n")
+                pending = lines.pop()
+                for line in lines:
+                    if line.rstrip():
+                        ctx.log(line.rstrip())
+            if exited:
+                # A child may still hold stdout open after the launcher exits.
+                # Ownership cleanup stops it; waiting for EOF here would hang.
                 break
+            if not output:
+                ctx.cancel_event.wait(0.05)
+        pending += decoder.decode(b"", final=True)
+        if pending.rstrip():
+            ctx.log(pending.rstrip())
     finally:
-        if process.stdout:
-            process.stdout.close()
+        try:
+            tree.close()
+        finally:
+            if process is not None and process.stdout:
+                process.stdout.close()
     if process.returncode != 0:
         raise RuntimeError(f"Процесс завершился с кодом {process.returncode}")
     return {"message": "Внешняя программа завершена успешно"}

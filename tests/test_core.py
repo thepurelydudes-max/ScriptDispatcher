@@ -107,7 +107,9 @@ class UniversalCutTests(unittest.TestCase):
 
             def fake_export(ctx, mp3, cue, output, output_prefix, start_marker, end_marker=None, same_marker_twice=False):
                 calls.append((mp3.parent.name, output_prefix, start_marker, end_marker, same_marker_twice))
-                return output / f"{output_prefix}_{cue.stem}.mp3"
+                path = output / f"{output_prefix}_{cue.stem}.mp3"
+                path.write_bytes(b"exported")
+                return path
 
             task = TaskDefinition(
                 id="universal",
@@ -150,7 +152,9 @@ class UniversalCutTests(unittest.TestCase):
 
             def fake_export(ctx, mp3, cue, output, output_prefix, marker):
                 calls.append((output_prefix, marker))
-                return [output / f"{output_prefix}_{cue.stem}.mp3"]
+                path = output / f"{output_prefix}_{cue.stem}.mp3"
+                path.write_bytes(b"exported")
+                return [path]
 
             task = TaskDefinition(
                 id="track",
@@ -206,7 +210,9 @@ class UniversalCutTests(unittest.TestCase):
 
             def fake_export(ctx, mp3, cue, output, prefix, start, end, same_marker_twice=False):
                 calls.append((prefix, start, end))
-                return output / f"{prefix}_{cue.stem}.mp3"
+                path = output / f"{prefix}_{cue.stem}.mp3"
+                path.write_bytes(b"exported")
+                return path
 
             task = TaskDefinition(
                 id="legacy-combined", name="Legacy combined", module="broadcast.universal_cut",

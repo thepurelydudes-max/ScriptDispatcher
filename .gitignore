@@ -15,6 +15,7 @@ dist/
 # User state and credentials: NEVER commit
 /data/
 /cash/
+/_BACKUPS/
 /private/*
 !/private/README.md
 /dispatcher/private_defaults.local.py

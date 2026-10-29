@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -221,14 +222,14 @@ def export_news(
     marker: str,
     rolik_mode: bool = False,
 ) -> list[Path]:
-    AudioSegment = _audio_segment(ctx)
     ctx.check_cancelled()
-    audio = AudioSegment.from_mp3(mp3)
     tracks = parse_cue(cue)
     blocks = group_rolik(tracks) if rolik_mode else group_news(tracks, marker)
     if not blocks:
         ctx.log(f"Маркерные блоки не найдены: {cue.name}")
         return []
+    AudioSegment = _audio_segment(ctx)
+    audio = AudioSegment.from_mp3(mp3)
     created: list[Path] = []
     for index, block in enumerate(blocks):
         ctx.check_cancelled()
@@ -257,13 +258,14 @@ def export_marker_blocks(
     contains the marker belongs to the same release.  The first non-matching
     track closes the block.  A later matching run becomes a new release.
     """
-    AudioSegment = _audio_segment(ctx)
-    audio = AudioSegment.from_mp3(mp3)
+    ctx.check_cancelled()
     tracks = parse_cue(cue)
     blocks = group_news(tracks, marker)
     if not blocks:
         ctx.log(f"Блоки с маркером не найдены: {cue.name}")
         return []
+    AudioSegment = _audio_segment(ctx)
+    audio = AudioSegment.from_mp3(mp3)
 
     created: list[Path] = []
     used_names: set[str] = set()
@@ -319,8 +321,7 @@ def export_between_markers(
     end_marker: str | None = None,
     same_marker_twice: bool = False,
 ) -> Path | None:
-    AudioSegment = _audio_segment(ctx)
-    audio = AudioSegment.from_mp3(mp3)
+    ctx.check_cancelled()
     tracks = parse_cue(cue)
     start_index: int | None = None
     end_index: int | None = None
@@ -339,6 +340,8 @@ def export_between_markers(
     if start_index is None or end_index is None or end_index < start_index:
         ctx.log(f"Не найдены маркеры фрагмента: {cue.name}")
         return None
+    AudioSegment = _audio_segment(ctx)
+    audio = AudioSegment.from_mp3(mp3)
     start_ms = int(tracks[start_index]["start"] * 1000)
     end_seconds = tracks[end_index]["end"]
     if end_seconds is None:
@@ -889,24 +892,67 @@ def _universal_cut_rename(
     template: str,
     source: str,
     claimed_names: set[str],
+    *,
+    destination: Path | None = None,
 ) -> list[Path]:
     """Rename finished exports in cash; bot uploads then use those exact paths."""
     result: list[Path] = []
+    reserved = set(claimed_names)
     for original in files:
-        desired_name = _universal_cut_output_name(template, original, source)
-        candidate = original.with_name(desired_name)
+        desired_name = _universal_cut_output_name(template, original, source) if template else original.name
+        candidate = (destination or original.parent) / desired_name
         counter = 2
-        while candidate.name.casefold() in claimed_names:
-            candidate = original.with_name(f"{Path(desired_name).stem}_{counter}.mp3")
+        while candidate.name.casefold() in reserved:
+            candidate = candidate.with_name(f"{Path(desired_name).stem}_{counter}.mp3")
             counter += 1
-        # A repeat of the same task may replace its own output from an earlier run,
-        # just like the old exporter did. Never overwrite a different export of
-        # this same run: tracked above in claimed_names.
-        if candidate != original:
-            original.replace(candidate)
-            ctx.log(f"Имя файла по шаблону: {original.name} → {candidate.name}")
         result.append(candidate)
-        claimed_names.add(candidate.name.casefold())
+        reserved.add(candidate.name.casefold())
+
+    # Final names may form a chain or swap with the original export names.
+    # Stage every fragment on the same filesystem before replacing any target.
+    staged: list[tuple[Path, Path]] = []
+    finished: list[tuple[Path, Path]] = []
+    staging_folders: dict[Path, Path] = {}
+    try:
+        for index, original in enumerate(files):
+            if original.parent not in staging_folders:
+                staging_folders[original.parent] = Path(tempfile.mkdtemp(
+                    prefix=".universal-cut-", dir=original.parent,
+                ))
+            temporary = staging_folders[original.parent] / f"{index}.mp3"
+            original.replace(temporary)
+            staged.append((original, temporary))
+        for (_original, temporary), candidate in zip(staged, result):
+            # Previous-run outputs remain replaceable, as with the old exporter.
+            temporary.replace(candidate)
+            finished.append((temporary, candidate))
+    except Exception:
+        # Free overlapping original paths before restoring. If the filesystem
+        # also refuses recovery, leave surviving bytes in place for a retry.
+        for temporary, candidate in reversed(finished):
+            try:
+                candidate.replace(temporary)
+            except OSError as exc:
+                ctx.log(f"Не удалось вернуть фрагмент {candidate}: {exc}")
+        for original, temporary in staged:
+            if temporary.exists() and not original.exists():
+                try:
+                    temporary.replace(original)
+                except OSError as exc:
+                    ctx.log(f"Фрагмент сохранён для восстановления в {temporary}: {exc}")
+        raise
+    finally:
+        for folder in staging_folders.values():
+            try:
+                # Never delete fragments left here by an unsuccessful recovery.
+                folder.rmdir()
+            except OSError:
+                ctx.log(f"Временная папка вырезки сохранена: {folder}")
+
+    claimed_names.update(reserved)
+    for original, candidate in zip(files, result):
+        if candidate.name != original.name:
+            ctx.log(f"Имя файла по шаблону: {original.name} → {candidate.name}")
     return result
 
 
@@ -1003,6 +1049,11 @@ def run_universal_cut(ctx: TaskContext) -> dict[str, Any]:
             _universal_cut_output_name(
                 filename_setting, Path(f"{filename_base}_{day_text}_00-00.mp3"), name
             )
+        # An exporter's raw name may equal another source's finalized name.
+        # Keep intermediate exports separate until all final names are reserved.
+        # Staging lives on the destination filesystem for atomic replacement;
+        # failed/cancelled exports remain here for inspection, never deleted.
+        source_output = Path(tempfile.mkdtemp(prefix=".universal-source-", dir=output))
         made: list[Path] = []
         pending_receipts: list[tuple[Path, Path]] = []
         for item_index, (_base, (mp3, cue)) in enumerate(pairs.items(), start=1):
@@ -1029,7 +1080,7 @@ def run_universal_cut(ctx: TaskContext) -> dict[str, Any]:
                         ctx,
                         mp3,
                         cue,
-                        output,
+                        source_output,
                         filename_base,
                         same_marker,
                     )
@@ -1039,7 +1090,7 @@ def run_universal_cut(ctx: TaskContext) -> dict[str, Any]:
                     ctx,
                     mp3,
                     cue,
-                    output,
+                    source_output,
                     filename_base,
                     start_marker,
                     end_marker,
@@ -1050,11 +1101,19 @@ def run_universal_cut(ctx: TaskContext) -> dict[str, Any]:
                 pending_receipts.append((receipt, cue))
 
         if not made:
+            try:
+                source_output.rmdir()
+            except OSError:
+                ctx.log(f"Временная папка вырезки сохранена: {source_output}")
             continue
-        if has_name_template:
-            made = _universal_cut_rename(
-                ctx, made, filename_setting, name, claimed_output_names
-            )
+        made = _universal_cut_rename(
+            ctx, made, filename_setting if has_name_template else "", name,
+            claimed_output_names, destination=output,
+        )
+        try:
+            source_output.rmdir()
+        except OSError:
+            ctx.log(f"Временная папка вырезки сохранена: {source_output}")
         processed_sources += 1
         all_created.extend(made)
 

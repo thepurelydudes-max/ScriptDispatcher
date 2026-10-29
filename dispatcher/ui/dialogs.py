@@ -791,6 +791,13 @@ class TaskDialog(QDialog):
 
     def accept_data(self):
         try:
+            if self.schedule_only:
+                # Hidden module editors may normalize legacy values or omit
+                # parameters unknown to this version. A schedule edit must
+                # leave the complete task definition otherwise untouched.
+                self.task.schedule = self.schedule_editor.value()
+                self.accept()
+                return
             if not self.name_edit.text().strip():
                 raise ValueError("Введите название задачи")
             self.task.name = self.name_edit.text().strip()

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import copy
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -41,12 +42,11 @@ from ..history import HistoryStore
 from ..daily_status import scheduled_status
 from ..models import AppConfig, TaskDefinition
 from ..modules import MODULES
-from ..modules.registry import defaults_for
 from ..schedule_engine import next_run, occurrence_key, previous_run, schedule_summary
 from ..security import SecretStore
 from ..storage import save_config
-from ..storage import application_root
 from ..task_runner import RunResult, TaskRunner
+from ..task_paths import task_input_paths, task_output_path
 from .dialogs import HistoryDialog, SettingsDialog, TaskDialog
 
 
@@ -79,6 +79,7 @@ class UiSignals(QObject):
     log = Signal(str, str)
     progress = Signal(str, int, str)
     done = Signal(object)
+    paths_checked = Signal(str, str)
 
 
 class MainWindow(QMainWindow):
@@ -99,8 +100,13 @@ class MainWindow(QMainWindow):
         self.signals.log.connect(self.on_task_log)
         self.signals.progress.connect(self.on_task_progress)
         self.signals.done.connect(self.on_task_done)
+        self.signals.paths_checked.connect(self.on_paths_checked, Qt.ConnectionType.QueuedConnection)
         self.runtime_status: dict[str, str] = {}
         self.runtime_messages: dict[str, str] = {}
+        self.runtime_started_day: dict[str, date] = {}
+        self.task_progress: dict[str, tuple[int, str]] = {}
+        self.path_checks: set[str] = set()
+        self.path_worker: threading.Thread | None = None
         self.fired_occurrences: dict[str, str] = {}
         self.catch_up_checked: set[str] = set()
         self.scheduler_enabled = True
@@ -334,11 +340,16 @@ class MainWindow(QMainWindow):
             return "disabled"
         last = self.history.last_for_task(task.id)
         if task.schedule.mode != "manual":
+            day = self._scheduler_now().date()
+            # A run can fail before history is written or finalized. Keep its
+            # UI result for the day it started, then use persisted daily state.
+            if runtime in {"success", "error", "cancelled", "skipped"} and self.runtime_started_day.get(task.id) == day:
+                return runtime
             # Scheduled tasks reset to Waiting at the first scheduler tick
             # after midnight, even when the program stays open overnight.
             return scheduled_status(
                 last,
-                self._scheduler_now().date(),
+                day,
                 str(self.config.settings.get("timezone", "Europe/Moscow")),
             )
         # Preserve legacy behaviour for tasks without a schedule.
@@ -413,7 +424,8 @@ class MainWindow(QMainWindow):
             if visible and category:
                 visible = bool(spec and spec.category == category)
             if visible and status_filter:
-                visible = self._task_status(task) == status_filter
+                status = self._task_status(task)
+                visible = status in {"ready", "success"} if status_filter == "ready" else status == status_filter
             self.table.setRowHidden(row, not visible)
 
     def task_by_id(self, task_id: str) -> TaskDefinition | None:
@@ -431,23 +443,13 @@ class MainWindow(QMainWindow):
         )
 
     def _primary_path(self, task: TaskDefinition) -> str:
-        for key in ("source_dir", "source_stolica", "input_file", "program"):
-            value = str(task.params.get(key, "")).strip()
-            if value:
-                return value
-        return ""
+        paths = task_input_paths(task)
+        return next((value for key, value in paths if key != "workdir"), "")
 
     def _output_path(self, task: TaskDefinition) -> str:
-        for key in ("output_dir", "output_file", "report_file"):
-            value = str(task.params.get(key, "")).strip()
-            if value:
-                return value
-        if task.module in (
-            "broadcast.news",
-            "broadcast.morning_shift",
-            "broadcast.morning_guest",
-        ):
-            return str(application_root() / "cash")
+        output = task_output_path(task)
+        if output:
+            return output
         if task.module == "excel.report":
             return "Рядом с выбранным Excel-файлом"
         if task.module == "broadcast.local_news":
@@ -461,6 +463,7 @@ class MainWindow(QMainWindow):
         enabled = task is not None
         for widget in (self.edit_button, self.test_button, self.open_button):
             widget.setEnabled(enabled)
+        self.test_button.setEnabled(bool(task and not self.path_checks))
         self.run_action.setEnabled(enabled)
         self.stop_action.setEnabled(
             bool(
@@ -472,6 +475,7 @@ class MainWindow(QMainWindow):
         self.schedule_action.setEnabled(enabled)
         self.edit_action.setEnabled(enabled)
         self.delete_action.setEnabled(enabled)
+        self._update_progress()
         if not task:
             self.detail_module.setText("—")
             self.detail_source.clear()
@@ -549,16 +553,19 @@ class MainWindow(QMainWindow):
     def run_selected(self):
         task = self.selected_task()
         if task:
-            self.start_task(task)
+            self.start_task(task, foreground=True)
 
-    def start_task(self, task: TaskDefinition):
+    def start_task(self, task: TaskDefinition, *, foreground: bool = False):
         if not self.runner.queue(task.id):
             QMessageBox.information(self, "Задача выполняется", "Эта задача уже запущена.")
             return
         self.runtime_status[task.id] = "running"
         self.runtime_messages[task.id] = ""
-        self.refresh_table(task.id)
-        self.details_tabs.setCurrentIndex(1)
+        self.runtime_started_day[task.id] = self._scheduler_now().date()
+        self.task_progress[task.id] = (0, "")
+        self.refresh_table(task.id if foreground else None)
+        if foreground:
+            self.details_tabs.setCurrentIndex(1)
         self.log_output.appendPlainText(f"\n—— {task.name} ——")
         secret_values = {
             "internal_bot_key": self.secrets.get("internal_bot_key"),
@@ -566,24 +573,26 @@ class MainWindow(QMainWindow):
         }
 
         def work():
-            result = self.runner.execute(
-                copy.deepcopy(task),
-                copy.deepcopy(self.config.settings),
-                secret_values,
-                on_log=lambda task_id, text: self.signals.log.emit(task_id, text),
-                on_progress=lambda task_id, value, text: self.signals.progress.emit(
-                    task_id, value, text
-                ),
-            )
+            try:
+                result = self.runner.execute(
+                    copy.deepcopy(task),
+                    copy.deepcopy(self.config.settings),
+                    secret_values,
+                    on_log=lambda task_id, text: self.signals.log.emit(task_id, text),
+                    on_progress=lambda task_id, value, text: self.signals.progress.emit(
+                        task_id, value, text
+                    ),
+                )
+            except BaseException as exc:
+                self.runner.unqueue(task.id)
+                result = RunResult(task.id, "error", f"{type(exc).__name__}: {exc}", {}, "")
             self.signals.done.emit(result)
 
         try:
             self.executor.submit(work)
-        except Exception:
+        except Exception as exc:
             self.runner.unqueue(task.id)
-            self.runtime_status[task.id] = "error"
-            self.refresh_table(task.id)
-            raise
+            self.on_task_done(RunResult(task.id, "error", f"{type(exc).__name__}: {exc}", {}, ""))
         self.update_active_count()
 
     def stop_selected(self):
@@ -600,17 +609,24 @@ class MainWindow(QMainWindow):
         self.log_output.appendPlainText(f"{prefix}: {text}")
 
     def on_task_progress(self, task_id: str, value: int, text: str):
-        task = self.task_by_id(task_id)
-        if task and self.selected_task() and self.selected_task().id == task_id:
-            self.progress.setVisible(True)
+        self.task_progress[task_id] = (value, text)
+        self._update_progress()
+
+    def _update_progress(self):
+        task = self.selected_task()
+        progress = self.task_progress.get(task.id) if task else None
+        self.progress.setVisible(progress is not None)
+        if progress is not None:
+            value, text = progress
             self.progress.setValue(value)
             self.progress.setFormat(f"{value}%  {text[:35]}")
 
     def on_task_done(self, result: RunResult):
         self.runtime_status[result.task_id] = result.status
         self.runtime_messages[result.task_id] = result.message
-        self.progress.setVisible(False)
-        self.refresh_table(result.task_id)
+        self.runtime_started_day.setdefault(result.task_id, self._scheduler_now().date())
+        self.task_progress.pop(result.task_id, None)
+        self.refresh_table()
         self.statusBar().showMessage(result.message, 10000)
         if result.status == "error":
             task = self.task_by_id(result.task_id)
@@ -626,7 +642,7 @@ class MainWindow(QMainWindow):
             return
         now = self._scheduler_now()
         for task in self.config.tasks:
-            if not task.enabled or self.runner.is_running(task.id):
+            if not task.enabled or self.runner.is_active(task.id):
                 continue
             key = occurrence_key(task.schedule, now)
             if key and self.fired_occurrences.get(task.id) != key:
@@ -642,7 +658,16 @@ class MainWindow(QMainWindow):
                     if last:
                         try:
                             last_value = datetime.fromisoformat(last.finished_at or last.started_at)
-                        except ValueError:
+                            # Legacy history is OS-local; scheduler values are
+                            # naive wall-clock times in its configured zone.
+                            if last_value.tzinfo is None:
+                                last_value = last_value.astimezone()
+                            try:
+                                zone = ZoneInfo(str(self.config.settings.get("timezone", "Europe/Moscow")))
+                            except (KeyError, ValueError):
+                                zone = None
+                            last_value = last_value.astimezone(zone).replace(tzinfo=None)
+                        except (ValueError, TypeError, OverflowError):
                             last_value = None
                     if previous and (last_value is None or last_value < previous):
                         self.start_task(task)
@@ -696,48 +721,59 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Настройки сохранены", 5000)
 
     def _candidate_paths(self, task: TaskDefinition) -> list[tuple[str, str]]:
-        result = []
-        for key, value in task.params.items():
-            if key.startswith(("source", "input", "block_list", "browser", "program")) and str(value).strip():
-                result.append((key, str(value).strip()))
-        if task.module == "external" and task.workdir:
-            result.insert(0, ("workdir", task.workdir))
-        return result
+        return task_input_paths(task)
 
     def test_selected_paths(self):
         task = self.selected_task()
-        if not task:
+        if not task or self.path_checks:
             return
-        lines = []
-        for key, value in self._candidate_paths(task):
-            expanded = Path(os.path.expandvars(os.path.expanduser(value)))
-            if not expanded.is_absolute() and task.workdir:
-                expanded = Path(task.workdir) / expanded
-            lines.append(f"{'✓' if expanded.exists() else '✗'}  {key}: {expanded}")
-        if not lines:
-            lines.append("У задачи пока не указаны входные пути.")
-        QMessageBox.information(self, "Проверка доступа", "\n".join(lines))
+        snapshot = copy.deepcopy(task)
+        self.path_checks.add(task.id)
+        self.update_details()
+
+        def work():
+            lines = []
+            try:
+                for key, value in self._candidate_paths(snapshot):
+                    expanded = Path(os.path.expandvars(os.path.expanduser(value)))
+                    if key != "workdir" and not expanded.is_absolute() and snapshot.workdir:
+                        expanded = Path(snapshot.workdir) / expanded
+                    try:
+                        exists = expanded.exists()
+                        lines.append(f"{'✓' if exists else '✗'}  {key}: {expanded}")
+                    except OSError as exc:
+                        lines.append(f"✗  {key}: {expanded} — {exc}")
+                if not lines:
+                    lines.append("У задачи пока не указаны входные пути.")
+            except Exception as exc:
+                lines.append(f"Ошибка проверки доступа: {exc}")
+            try:
+                self.signals.paths_checked.emit(snapshot.id, "\n".join(lines))
+            except RuntimeError:
+                # The application may close while an OS network probe is
+                # blocked. Its daemon worker must not keep the process alive.
+                pass
+
+        try:
+            self.path_worker = threading.Thread(target=work, name="dispatcher-path-check", daemon=True)
+            self.path_worker.start()
+        except Exception as exc:
+            self.on_paths_checked(task.id, f"Ошибка проверки доступа: {exc}")
+
+    def on_paths_checked(self, task_id: str, message: str):
+        self.path_checks.discard(task_id)
+        self.update_details()
+        QMessageBox.information(self, "Проверка доступа", message)
 
     def open_selected_folder(self):
         task = self.selected_task()
         if not task:
             return
-        raw_output = ""
-        for key in ("output_dir", "output_file", "report_file"):
-            value = str(task.params.get(key, "")).strip()
-            if value:
-                raw_output = value
-                break
+        raw_output = task_output_path(task)
         if raw_output:
             path = Path(os.path.expandvars(os.path.expanduser(raw_output)))
             if not path.is_absolute() and task.module == "external" and task.workdir:
                 path = Path(task.workdir) / path
-        elif task.module in (
-            "broadcast.news",
-            "broadcast.morning_shift",
-            "broadcast.morning_guest",
-        ):
-            path = application_root() / "cash"
         else:
             source_raw = self._primary_path(task)
             if not source_raw:
@@ -747,7 +783,12 @@ class MainWindow(QMainWindow):
                 path = path.parent
         if not str(path):
             return
-        if path.is_file():
+        spec = MODULES.get(task.module)
+        output_keys = {"output_file", "report_file"}
+        file_output = any(field.key in output_keys and field.kind == "save_file" for field in spec.fields) if spec else False
+        file_output = file_output or any(str(task.params.get(key, "")).strip() for key in output_keys)
+        output_is_file = bool(raw_output and not str(task.params.get("output_dir", "")).strip() and file_output)
+        if output_is_file or path.is_file():
             path = path.parent
         if not path.exists():
             QMessageBox.warning(self, "Папка не найдена", str(path))

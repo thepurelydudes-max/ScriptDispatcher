@@ -66,26 +66,60 @@ def occurrence_key(schedule: ScheduleConfig, now: datetime) -> str | None:
 
 
 def next_run(schedule: ScheduleConfig, now: datetime | None = None) -> datetime | None:
-    if schedule.mode == "manual":
-        return None
-    now = (now or datetime.now()).replace(second=0, microsecond=0)
-    candidate = now + timedelta(minutes=1)
-    max_minutes = 8 * 24 * 60
-    for _ in range(max_minutes):
-        if occurrence_key(schedule, candidate):
-            return candidate
-        candidate += timedelta(minutes=1)
-    return None
+    return _adjacent_run(schedule, now or datetime.now(), 1)
 
 
 def previous_run(schedule: ScheduleConfig, now: datetime | None = None) -> datetime | None:
-    if schedule.mode == "manual":
+    return _adjacent_run(schedule, now or datetime.now(), -1)
+
+
+def _adjacent_run(schedule: ScheduleConfig, now: datetime, direction: int) -> datetime | None:
+    """Find an occurrence within eight days without walking every minute.
+
+    Match occurrence_key's wall-clock semantics, including excluding the entire
+    current minute and treating an overnight interval window as empty.
+    """
+    if schedule.mode == "manual" or not schedule.weekdays:
         return None
-    now = (now or datetime.now()).replace(second=0, microsecond=0)
-    candidate = now - timedelta(minutes=1)
-    max_minutes = 8 * 24 * 60
-    for _ in range(max_minutes):
-        if occurrence_key(schedule, candidate):
-            return candidate
-        candidate -= timedelta(minutes=1)
+    now = now.replace(second=0, microsecond=0)
+    weekdays = set(schedule.weekdays)
+    if not weekdays.intersection(range(7)):
+        return None
+    boundary = now + timedelta(days=8 * direction)
+    if schedule.mode == "times":
+        times = normalize_times(schedule.times)
+        if not times:
+            return None
+        minutes = [int(value[:2]) * 60 + int(value[3:]) for value in times]
+        if direction < 0:
+            minutes.reverse()
+    else:
+        start_h, start_m = parse_hhmm(schedule.window_start)
+        end_h, end_m = parse_hhmm(schedule.window_end)
+        start = start_h * 60 + start_m
+        end = end_h * 60 + end_m
+        step = max(1, schedule.interval_minutes)
+        if start > end:
+            return None
+    for offset in range(9):
+        day = now + timedelta(days=offset * direction)
+        if day.weekday() not in weekdays:
+            continue
+        if schedule.mode == "times":
+            candidates = minutes
+        else:
+            current = now.hour * 60 + now.minute
+            if direction > 0:
+                earliest = max(start, current + 1) if offset == 0 else start
+                candidate_minute = start + max(0, (earliest - start + step - 1) // step) * step
+            else:
+                latest = min(end, current - 1) if offset == 0 else end
+                candidate_minute = start + ((latest - start) // step) * step
+            candidates = [candidate_minute] if start <= candidate_minute <= end else []
+        for minute in candidates:
+            candidate = day.replace(hour=minute // 60, minute=minute % 60)
+            if direction > 0 and now < candidate <= boundary:
+                return candidate
+            if direction < 0 and boundary <= candidate < now:
+                return candidate
     return None

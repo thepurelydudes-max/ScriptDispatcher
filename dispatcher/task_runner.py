@@ -16,7 +16,9 @@ from .history import HistoryStore
 from .models import TaskDefinition
 from .modules import run_module
 from .modules.common import TaskCancelled, TaskContext
+from .process_tree import OwnedProcessTree, enter_task_process
 from .storage import logs_dir, temp_dir
+from .task_paths import task_resource_paths
 
 
 @dataclass(slots=True)
@@ -58,6 +60,8 @@ def _module_process_main(
     run_dir: str,
     cancel_event,
     messages,
+    ready=None,
+    proceed=None,
 ) -> None:
     """Запускается в отдельном процессе, чтобы «Стоп» мог прервать любой модуль."""
     _hide_windows_subprocess_windows()
@@ -69,6 +73,8 @@ def _module_process_main(
         messages.put(("progress", int(value), str(message)))
 
     try:
+        if ready is not None and proceed is not None:
+            enter_task_process(ready, proceed)
         context = TaskContext(
             task=task,
             settings=settings,
@@ -100,21 +106,19 @@ class TaskRunner:
 
     @staticmethod
     def _task_resources(task: TaskDefinition) -> set[str]:
-        values: list[str] = []
-        if task.workdir:
-            values.append(task.workdir)
-        for key, value in task.params.items():
-            if key.startswith(("source", "output", "input", "report", "block_list")):
-                text = str(value).strip()
-                if text:
-                    values.append(text)
-        result = set()
-        for value in values:
-            expanded = os.path.expandvars(os.path.expanduser(value))
-            if not os.path.isabs(expanded) and task.workdir:
-                expanded = os.path.join(task.workdir, expanded)
-            result.add(os.path.normcase(os.path.normpath(expanded)))
-        return result
+        return task_resource_paths(task)
+
+    @staticmethod
+    def _shared_resource(resources: set[str], other_resources: set[str]) -> str | None:
+        for path in resources:
+            for other in other_resources:
+                try:
+                    common = os.path.commonpath((path, other))
+                except ValueError:  # Separate Windows drives cannot overlap.
+                    continue
+                if common == path or common == other:
+                    return common
+        return None
 
     def is_running(self, task_id: str) -> bool:
         with self._guard:
@@ -161,8 +165,19 @@ class TaskRunner:
         on_log: Callable[[str, str], None] | None = None,
         on_progress: Callable[[str, int, str], None] | None = None,
     ) -> RunResult:
-        process_context = multiprocessing.get_context("spawn")
-        cancel_event = process_context.Event()
+        try:
+            process_context = multiprocessing.get_context("spawn")
+            cancel_event = process_context.Event()
+        except Exception as exc:
+            self.unqueue(task.id)
+            return RunResult(task.id, "error", f"{type(exc).__name__}: {exc}", {}, "")
+        # Resolving a network path may block in the OS. Keep it outside the
+        # state lock so the GUI can still query/cancel a pending task.
+        try:
+            resources = self._task_resources(task)
+        except Exception as exc:
+            self.unqueue(task.id)
+            return RunResult(task.id, "error", f"{type(exc).__name__}: {exc}", {}, "")
         with self._guard:
             self._pending.discard(task.id)
             if task.id in self._cancel_requested:
@@ -176,14 +191,13 @@ class TaskRunner:
                 )
             if task.id in self._running:
                 return RunResult(task.id, "skipped", "Задача уже выполняется", {}, "")
-            resources = self._task_resources(task)
             for other_task_id, other_resources in self._resources.items():
-                shared = resources & other_resources
-                if shared:
+                shared = self._shared_resource(resources, other_resources)
+                if shared is not None:
                     return RunResult(
                         task.id,
                         "skipped",
-                        f"Ресурс уже используется задачей {other_task_id}: {next(iter(shared))}",
+                        f"Ресурс уже используется задачей {other_task_id}: {shared}",
                         {},
                         "",
                     )
@@ -191,17 +205,16 @@ class TaskRunner:
             self._resources[task.id] = resources
             self._cancel[task.id] = cancel_event
 
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        log_path = logs_dir() / f"{stamp}_{task.id}.log"
-        run_dir = temp_dir() / task.id / stamp
-        run_dir.mkdir(parents=True, exist_ok=True)
-        run_id = self.history.start(task.id, task.name, str(log_path))
+        log_path: Path | None = None
+        run_id: int | None = None
         log_lock = threading.Lock()
 
         def log(message: str) -> None:
             timestamp = datetime.now().strftime("%H:%M:%S")
             line = f"[{timestamp}] {message}"
             with log_lock:
+                if log_path is None:
+                    return
                 with log_path.open("a", encoding="utf-8") as stream:
                     stream.write(line + "\n")
             if on_log:
@@ -216,9 +229,40 @@ class TaskRunner:
         data: dict[str, Any] = {}
         process = None
         messages = None
+        tree = None
+
+        def report_error(exc: Exception, details: str = "") -> None:
+            nonlocal status, message, data
+            error = f"{type(exc).__name__}: {exc}"
+            message = f"{message}; {error}" if status == "error" else error
+            status = "error"
+            data = {}
+            # A failed logger must not prevent the UI result or cleanup.
+            try:
+                log("ОШИБКА: " + error)
+            except Exception:
+                pass
+            if log_path is not None and details:
+                try:
+                    with log_path.open("a", encoding="utf-8") as stream:
+                        stream.write("\n" + details)
+                except Exception:
+                    pass
+
         try:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            log_path = logs_dir() / f"{stamp}_{task.id}.log"
+            run_dir = temp_dir() / task.id / stamp
+            run_dir.mkdir(parents=True, exist_ok=True)
+            run_id = self.history.start(task.id, task.name, str(log_path))
             log(f"Запуск задачи «{task.name}»")
             messages = process_context.Queue()
+            # Browser windows intentionally outlive the task which opens them.
+            own_tree = task.module != "yandex.open_links"
+            ready = process_context.Event() if own_tree else None
+            proceed = process_context.Event() if own_tree else None
+            if own_tree:
+                tree = OwnedProcessTree()
             process = process_context.Process(
                 target=_module_process_main,
                 args=(
@@ -228,6 +272,8 @@ class TaskRunner:
                     str(run_dir),
                     cancel_event,
                     messages,
+                    ready,
+                    proceed,
                 ),
                 name=f"script-dispatcher-{task.id}",
                 daemon=False,
@@ -235,6 +281,22 @@ class TaskRunner:
             process.start()
             with self._guard:
                 self._processes[task.id] = process
+            if tree is not None:
+                # The child cannot launch task code until its group/job belongs
+                # to us. In particular, Windows Job assignment must precede
+                # any external program or FFmpeg launch.
+                deadline = time.monotonic() + 30
+                while not ready.wait(timeout=0.05):
+                    if cancel_event.is_set():
+                        raise TaskCancelled("Задача остановлена до начала выполнения")
+                    if not process.is_alive():
+                        raise RuntimeError(f"Рабочий процесс не запущен (код {process.exitcode})")
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Рабочий процесс не подтвердил готовность за 30 секунд")
+                tree.attach(process.pid)
+                if cancel_event.is_set():
+                    raise TaskCancelled("Задача остановлена до начала выполнения")
+                proceed.set()
 
             child_result: tuple | None = None
             cancel_started: float | None = None
@@ -259,6 +321,8 @@ class TaskRunner:
                         cancel_started = time.monotonic()
                         log("Получена команда остановки…")
                     if time.monotonic() - cancel_started >= 0.75 and process.is_alive():
+                        if tree is not None:
+                            tree.close()
                         process.terminate()
                         process.join(timeout=2)
                         if process.is_alive() and hasattr(process, "kill"):
@@ -290,28 +354,42 @@ class TaskRunner:
                 log("ОШИБКА: " + message)
             else:
                 log(message)
+        except TaskCancelled as exc:
+            status = "cancelled"
+            message = str(exc)
+            data = {}
         except Exception as exc:
-            status = "error"
-            message = f"{type(exc).__name__}: {exc}"
-            log("ОШИБКА: " + message)
-            with log_path.open("a", encoding="utf-8") as stream:
-                stream.write("\n" + traceback.format_exc())
+            report_error(exc, traceback.format_exc())
         finally:
-            if process is not None and process.is_alive():
-                process.terminate()
-                process.join(timeout=2)
-                if process.is_alive() and hasattr(process, "kill"):
-                    process.kill()
-                    process.join(timeout=2)
-            if messages is not None:
+            try:
                 try:
-                    messages.close()
-                except Exception:
-                    pass
-            self.history.finish(run_id, status, message)
-            with self._guard:
-                self._running.discard(task.id)
-                self._cancel.pop(task.id, None)
-                self._resources.pop(task.id, None)
-                self._processes.pop(task.id, None)
-        return RunResult(task.id, status, message, data, str(log_path))
+                    if tree is not None:
+                        tree.close()
+                except Exception as exc:
+                    report_error(exc, traceback.format_exc())
+                try:
+                    if process is not None and process.is_alive():
+                        process.terminate()
+                        process.join(timeout=2)
+                        if process.is_alive() and hasattr(process, "kill"):
+                            process.kill()
+                            process.join(timeout=2)
+                except Exception as exc:
+                    report_error(exc, traceback.format_exc())
+                if messages is not None:
+                    try:
+                        messages.close()
+                    except Exception:
+                        pass
+                if run_id is not None:
+                    try:
+                        self.history.finish(run_id, status, message)
+                    except Exception as exc:
+                        report_error(exc, traceback.format_exc())
+            finally:
+                with self._guard:
+                    self._running.discard(task.id)
+                    self._cancel.pop(task.id, None)
+                    self._resources.pop(task.id, None)
+                    self._processes.pop(task.id, None)
+        return RunResult(task.id, status, message, data, str(log_path) if log_path is not None else "")
