@@ -34,11 +34,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..history import HistoryRecord
 from ..models import ScheduleConfig, TaskDefinition
 from ..modules import MODULES
 from ..modules.registry import FieldSpec, defaults_for
 from ..schedule_engine import normalize_times
+from .history_dialog import HistoryDialog
 
 
 class PathEditor(QWidget):
@@ -925,45 +925,3 @@ class SettingsDialog(QDialog):
             self.internal_bot_key.text().strip(),
             self.yandex_cookie.toPlainText().strip(),
         )
-
-
-class HistoryDialog(QDialog):
-    def __init__(self, records: list[HistoryRecord], parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("История запусков")
-        self.resize(980, 560)
-        table = QTableWidget(len(records), 6)
-        table.setHorizontalHeaderLabels(
-            ["Задача", "Начало", "Окончание", "Состояние", "Сообщение", "Журнал"]
-        )
-        table.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers
-        )
-        table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows
-        )
-        for row, record in enumerate(records):
-            values = [
-                record.task_name,
-                record.started_at.replace("T", " "),
-                (record.finished_at or "—").replace("T", " "),
-                record.status,
-                record.message,
-                record.log_path,
-            ]
-            for column, value in enumerate(values):
-                table.setItem(row, column, QTableWidgetItem(value))
-        table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.ResizeToContents
-        )
-        table.horizontalHeader().setSectionResizeMode(
-            4, QHeaderView.ResizeMode.Stretch
-        )
-        close_button = QDialogButtonBox.StandardButton.Close
-        close = QDialogButtonBox(close_button)
-        close.button(close_button).setText("Закрыть")
-        close.rejected.connect(self.reject)
-        close.accepted.connect(self.accept)
-        layout = QVBoxLayout(self)
-        layout.addWidget(table)
-        layout.addWidget(close)

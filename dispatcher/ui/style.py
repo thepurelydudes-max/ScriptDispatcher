@@ -131,4 +131,18 @@ QToolTip {
     background: #172630;
     border: 1px solid #3c5367;
 }
+QLabel#pageTitle { font-size: 20pt; font-weight: 600; color: #f0f5fa; }
+QLabel#detailTitle { font-size: 13pt; font-weight: 600; padding-bottom: 4px; }
+QLabel#mutedText { color: #9bacbc; padding: 4px; }
+QWidget#rowControls, QWidget#taskStatus, QWidget#rowControls QCheckBox,
+QWidget#taskStatus QLabel { background: transparent; }
+QWidget#rowControls QToolButton {
+    min-width: 25px; max-width: 25px; min-height: 25px; max-height: 25px;
+    padding: 0; border-radius: 4px;
+}
+QPushButton:disabled, QToolButton:disabled { color: #607080; border-color: #273644; background: #14202a; }
+QSplitter::handle { background: #253a4b; height: 6px; }
+QSplitter::handle:hover { background: #3b6b91; }
+QProgressBar#rowProgress { border: none; background: #263747; border-radius: 2px; }
+QProgressBar#rowProgress::chunk { background: #66b2ff; border-radius: 2px; }
 """

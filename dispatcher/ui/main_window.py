@@ -8,11 +8,12 @@ from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QCloseEvent, QIcon
+from PySide6.QtCore import QByteArray, QObject, Qt, QTimer, Signal, QUrl
+from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -28,12 +29,16 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QStatusBar,
+    QSplitter,
     QStyle,
+    QStyleOptionViewItem,
+    QStyledItemDelegate,
     QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
     QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -48,31 +53,9 @@ from ..storage import save_config
 from ..task_runner import RunResult, TaskRunner
 from ..task_paths import task_input_paths, task_output_path
 from .dialogs import HistoryDialog, SettingsDialog, TaskDialog
-
-
-STATUS_LABELS = {
-    "ready": "Готово",
-    "running": "Выполняется",
-    "stopping": "Останавливается",
-    "waiting": "Ожидание",
-    "success": "Готово",
-    "error": "Ошибка",
-    "cancelled": "Остановлено",
-    "disabled": "Отключено",
-    "skipped": "Пропущено",
-}
-
-STATUS_COLORS = {
-    "ready": "#45c65a",
-    "running": "#278be7",
-    "stopping": "#d48b38",
-    "waiting": "#e5a91f",
-    "success": "#45c65a",
-    "error": "#e64747",
-    "cancelled": "#d48b38",
-    "disabled": "#8593a0",
-    "skipped": "#8593a0",
-}
+from .presentation import STATUS_COLORS, STATUS_LABELS, format_history_time
+from .view_state import load_view_state, save_view_state
+from ..storage import data_dir
 
 
 class UiSignals(QObject):
@@ -82,6 +65,17 @@ class UiSignals(QObject):
     paths_checked = Signal(str, str)
 
 
+class StatusDelegate(QStyledItemDelegate):
+    """Paint the selection beneath the status widget without duplicate text."""
+
+    def paint(self, painter, option, index):
+        view = QStyleOptionViewItem(option)
+        self.initStyleOption(view, index)
+        view.text = ""
+        style = view.widget.style() if view.widget else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, view, painter, view.widget)
+
+
 class MainWindow(QMainWindow):
     def __init__(
         self,
@@ -89,6 +83,8 @@ class MainWindow(QMainWindow):
         secrets: SecretStore,
         history: HistoryStore,
         parent=None,
+        *,
+        view_state_path: Path | None = None,
     ):
         super().__init__(parent)
         self.config = config
@@ -111,6 +107,12 @@ class MainWindow(QMainWindow):
         self.catch_up_checked: set[str] = set()
         self.scheduler_enabled = True
         self.force_exit = False
+        self.view_state_path = view_state_path
+        self._history_cache = {}
+        self._tasks_by_id = {}
+        self._row_controls = {}
+        self._row_states = {}
+        self._row_signatures = {}
 
         self.setWindowTitle("Диспетчер скриптов")
         self.resize(1500, 900)
@@ -124,6 +126,7 @@ class MainWindow(QMainWindow):
         self.create_central()
         self.create_statusbar()
         self.create_tray()
+        self.restore_view()
         self.refresh_table()
 
         self.scheduler_timer = QTimer(self)
@@ -131,6 +134,10 @@ class MainWindow(QMainWindow):
         self.scheduler_timer.timeout.connect(self.check_scheduler)
         self.scheduler_timer.start()
         QTimer.singleShot(1500, self.check_scheduler)
+        self.runtime_timer = QTimer(self)
+        self.runtime_timer.setInterval(500)
+        self.runtime_timer.timeout.connect(self.refresh_runtime_cells)
+        self.runtime_timer.start()
 
     def create_actions(self):
         style = self.style()
@@ -168,6 +175,15 @@ class MainWindow(QMainWindow):
         self.history_action.triggered.connect(self.show_history)
         self.settings_action.triggered.connect(self.show_settings)
         self.delete_action.triggered.connect(self.delete_selected)
+        for action, shortcut in ((self.add_action, "Ctrl+N"), (self.run_action, "F5"),
+                                 (self.stop_action, "Shift+F5"), (self.edit_action, "Ctrl+E"),
+                                 (self.history_action, "Ctrl+H")):
+            action.setShortcut(QKeySequence(shortcut))
+            self.addAction(action)
+        focus_search = QAction(self)
+        focus_search.setShortcut(QKeySequence("Ctrl+F"))
+        focus_search.triggered.connect(lambda: self.search.setFocus())
+        self.addAction(focus_search)
 
     def create_toolbar(self):
         toolbar = QToolBar("Команды")
@@ -193,27 +209,45 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(12, 12, 12, 8)
         outer.setSpacing(10)
 
+        heading = QHBoxLayout()
+        title = QLabel("Задачи")
+        title.setObjectName("pageTitle")
+        self.summary_label = QLabel()
+        self.summary_label.setObjectName("mutedText")
+        heading.addWidget(title)
+        heading.addStretch()
+        heading.addWidget(self.summary_label)
+        outer.addLayout(heading)
+
         filters = QHBoxLayout()
         self.search = QLineEdit()
         self.search.setPlaceholderText("Поиск задач")
+        self.search.setClearButtonEnabled(True)
         self.category_filter = QComboBox()
         self.category_filter.addItem("Все модули", "")
         for category in sorted({spec.category for spec in MODULES.values()}):
             self.category_filter.addItem(category, category)
         self.status_filter = QComboBox()
         self.status_filter.addItem("Все состояния", "")
-        for key in ("ready", "running", "waiting", "error", "disabled"):
+        for key in ("queued", "running", "stopping", "waiting", "ready", "success", "error", "cancelled", "skipped", "disabled"):
             self.status_filter.addItem(STATUS_LABELS[key], key)
-        self.search.textChanged.connect(self.apply_filters)
+        self.filter_timer = QTimer(self)
+        self.filter_timer.setSingleShot(True)
+        self.filter_timer.setInterval(150)
+        self.filter_timer.timeout.connect(self.apply_filters)
+        self.search.textChanged.connect(lambda: self.filter_timer.start())
         self.category_filter.currentIndexChanged.connect(self.apply_filters)
         self.status_filter.currentIndexChanged.connect(self.apply_filters)
         filters.addWidget(self.search, 2)
         filters.addWidget(self.category_filter, 1)
         filters.addWidget(self.status_filter, 1)
-        filters.addStretch(2)
+        reset = QPushButton("Сбросить")
+        reset.setToolTip("Сбросить поиск и фильтры")
+        reset.clicked.connect(self.reset_filters)
+        filters.addWidget(reset)
         outer.addLayout(filters)
 
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels(
             [
                 "Задача",
@@ -223,9 +257,12 @@ class MainWindow(QMainWindow):
                 "Состояние",
                 "Последний запуск",
                 "Следующий запуск",
+                "Управление",
             ]
         )
         self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(False)
+        self.table.setItemDelegateForColumn(4, StatusDelegate(self.table))
         self.table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
         )
@@ -236,39 +273,88 @@ class MainWindow(QMainWindow):
             QAbstractItemView.EditTrigger.NoEditTriggers
         )
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(43)
+        self.table.verticalHeader().setDefaultSectionSize(48)
         header = self.table.horizontalHeader()
         resize_mode = QHeaderView.ResizeMode
-        header.setSectionResizeMode(0, resize_mode.ResizeToContents)
-        header.setSectionResizeMode(1, resize_mode.ResizeToContents)
+        header.setSectionResizeMode(resize_mode.Interactive)
         header.setSectionResizeMode(2, resize_mode.Stretch)
-        header.setSectionResizeMode(3, resize_mode.ResizeToContents)
-        header.setSectionResizeMode(4, resize_mode.ResizeToContents)
-        header.setSectionResizeMode(5, resize_mode.ResizeToContents)
-        header.setSectionResizeMode(6, resize_mode.ResizeToContents)
+        header.setSectionResizeMode(7, resize_mode.Fixed)
+        header.setMinimumSectionSize(64)
+        for column, width in enumerate((210, 70, 180, 135, 170, 128, 128, 105)):
+            self.table.setColumnWidth(column, width)
+        header.sectionClicked.connect(self.sort_requested)
         self.table.itemSelectionChanged.connect(self.update_details)
         self.table.itemDoubleClicked.connect(lambda _item: self.edit_selected())
         self.table.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu
         )
         self.table.customContextMenuRequested.connect(self.table_menu)
-        outer.addWidget(self.table, 5)
+        self.splitter = QSplitter(Qt.Orientation.Vertical)
+        self.splitter.setChildrenCollapsible(False)
+        list_pane = QWidget()
+        list_layout = QVBoxLayout(list_pane)
+        list_layout.setContentsMargins(0, 0, 0, 0)
+        list_layout.setSpacing(4)
+        list_layout.addWidget(self.table)
+        self.empty_label = QLabel()
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setObjectName("mutedText")
+        list_layout.addWidget(self.empty_label)
+        self.splitter.addWidget(list_pane)
 
         self.details_tabs = QTabWidget()
         details = QWidget()
         details_layout = QHBoxLayout(details)
-        details_layout.setContentsMargins(14, 12, 14, 12)
+        details_layout.setContentsMargins(14, 8, 14, 8)
         self.detail_form = QFormLayout()
+        self.detail_form.setVerticalSpacing(3)
         self.detail_source = QLineEdit()
         self.detail_source.setReadOnly(True)
         self.detail_output = QLineEdit()
         self.detail_output.setReadOnly(True)
+        for editor in (self.detail_source, self.detail_output):
+            editor.setStyleSheet("padding: 3px 6px;")
+            editor.setMaximumHeight(26)
         self.detail_module = QLabel("—")
         self.detail_schedule = QLabel("—")
-        self.detail_form.addRow("Модуль:", self.detail_module)
+        self.detail_title = QLabel("Выберите задачу в списке")
+        self.detail_title.setObjectName("detailTitle")
+        self.detail_title.setTextFormat(Qt.TextFormat.PlainText)
+        self.detail_state = QLabel("—")
+        self.detail_last_run = QLabel("—")
+        self.detail_next_run = QLabel("—")
+        self.detail_message = QLabel("—")
+        self.detail_message.setTextFormat(Qt.TextFormat.PlainText)
+        self.detail_message.setWordWrap(True)
+        self.detail_message.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.detail_message.setMaximumHeight(56)
+        self.detail_step = QLabel("—")
+        self.detail_step.setTextFormat(Qt.TextFormat.PlainText)
+        self.detail_step.setWordWrap(True)
+        self.detail_progress = QProgressBar()
+        self.detail_progress.setMaximumHeight(12)
+        self.detail_progress.setTextVisible(False)
+        self.detail_progress.hide()
+        self.detail_form.addRow(self.detail_title)
+        state_row = QHBoxLayout()
+        state_row.addWidget(self.detail_state)
+        state_row.addWidget(QLabel("·"))
+        state_row.addWidget(self.detail_module, 1)
+        self.detail_form.addRow("Состояние:", state_row)
         self.detail_form.addRow("Источник:", self.detail_source)
         self.detail_form.addRow("Папка результатов:", self.detail_output)
         self.detail_form.addRow("Расписание:", self.detail_schedule)
+        times_row = QHBoxLayout()
+        times_row.addWidget(QLabel("Последний:"))
+        times_row.addWidget(self.detail_last_run)
+        times_row.addSpacing(18)
+        times_row.addWidget(QLabel("Следующий:"))
+        times_row.addWidget(self.detail_next_run)
+        times_row.addStretch()
+        self.detail_form.addRow("Запуски:", times_row)
+        self.detail_form.addRow("Последний результат:", self.detail_message)
+        self.detail_form.addRow("Текущий этап:", self.detail_step)
+        self.detail_form.addRow(self.detail_progress)
         details_layout.addLayout(self.detail_form, 1)
 
         detail_buttons = QVBoxLayout()
@@ -276,12 +362,18 @@ class MainWindow(QMainWindow):
         self.edit_button.setObjectName("primaryButton")
         self.test_button = QPushButton("Проверить доступ")
         self.open_button = QPushButton("Открыть папку")
+        self.log_button = QPushButton("Открыть журнал")
+        self.task_history_button = QPushButton("История задачи")
         self.edit_button.clicked.connect(self.edit_selected)
         self.test_button.clicked.connect(self.test_selected_paths)
         self.open_button.clicked.connect(self.open_selected_folder)
+        self.log_button.clicked.connect(self.open_selected_log)
+        self.task_history_button.clicked.connect(self.show_history)
         detail_buttons.addWidget(self.edit_button)
         detail_buttons.addWidget(self.test_button)
         detail_buttons.addWidget(self.open_button)
+        detail_buttons.addWidget(self.log_button)
+        detail_buttons.addWidget(self.task_history_button)
         detail_buttons.addStretch()
         details_layout.addLayout(detail_buttons)
 
@@ -295,7 +387,11 @@ class MainWindow(QMainWindow):
 
         self.details_tabs.addTab(details, "Параметры выбранной задачи")
         self.details_tabs.addTab(log_widget, "Журнал текущего сеанса")
-        outer.addWidget(self.details_tabs, 2)
+        self.splitter.addWidget(self.details_tabs)
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 2)
+        self.splitter.setSizes([500, 320])
+        outer.addWidget(self.splitter)
 
         self.setCentralWidget(container)
 
@@ -304,7 +400,7 @@ class MainWindow(QMainWindow):
         self.scheduler_label = QLabel("●  Планировщик работает")
         self.scheduler_label.setStyleSheet("color:#56c967")
         self.progress = QProgressBar()
-        self.progress.setFixedWidth(260)
+        self.progress.setFixedWidth(110)
         self.progress.setVisible(False)
         self.active_label = QLabel("Активных задач: 0")
         status.addWidget(self.scheduler_label)
@@ -332,13 +428,17 @@ class MainWindow(QMainWindow):
 
     def _task_status(self, task: TaskDefinition) -> str:
         runtime = self.runtime_status.get(task.id)
-        if runtime in ("running", "stopping"):
-            return runtime
+        if runtime == "stopping":
+            return "stopping"
         if self.runner.is_running(task.id):
             return "running"
+        if self.runner.is_active(task.id):
+            return "queued"
+        if runtime == "running":
+            return runtime
         if not task.enabled:
             return "disabled"
-        last = self.history.last_for_task(task.id)
+        last = self._history_cache.get(task.id)
         if task.schedule.mode != "manual":
             day = self._scheduler_now().date()
             # A run can fail before history is written or finalized. Keep its
@@ -373,13 +473,23 @@ class MainWindow(QMainWindow):
         if preserve_id is None:
             selected = self.selected_task()
             preserve_id = selected.id if selected else None
+        self._tasks_by_id = {task.id: task for task in self.config.tasks}
+        self._history_cache = self.history.latest_by_task()
+        scroll = self.table.verticalScrollBar().value()
+        horizontal = self.table.horizontalScrollBar().value()
+        sorting = self.table.isSortingEnabled()
+        self.table.setSortingEnabled(False)
+        self.table.blockSignals(True)
+        self._row_controls.clear()
+        self._row_states.clear()
+        self._row_signatures.clear()
         self.table.setRowCount(0)
         for task in self.config.tasks:
             spec = MODULES.get(task.module)
             row = self.table.rowCount()
             self.table.insertRow(row)
-            last = self.history.last_for_task(task.id)
-            last_text = (last.finished_at or last.started_at).replace("T", " ")[:16] if last else "—"
+            last = self._history_cache.get(task.id)
+            last_text = format_history_time(last.finished_at or last.started_at, str(self.config.settings.get("timezone", "Europe/Moscow"))) if last else "—"
             upcoming = next_run(task.schedule, self._scheduler_now())
             status = self._task_status(task)
             values = [
@@ -402,12 +512,146 @@ class MainWindow(QMainWindow):
                     item.setData(Qt.ItemDataRole.UserRole, task.id)
                 if column == 4:
                     item.setForeground(QColor(STATUS_COLORS.get(status, "#ffffff")))
+                item.setToolTip(value)
                 self.table.setItem(row, column, item)
-            if preserve_id == task.id:
+            self.table.setItem(row, 7, QTableWidgetItem(""))
+            self.create_row_controls(row, task)
+            self.create_row_state(row, task)
+        self.table.setSortingEnabled(sorting)
+        self.table.blockSignals(False)
+        for row in range(self.table.rowCount()):
+            if self.table.item(row, 0).data(Qt.ItemDataRole.UserRole) == preserve_id:
                 self.table.selectRow(row)
+                break
         self.apply_filters()
+        self.table.verticalScrollBar().setValue(scroll)
+        self.table.horizontalScrollBar().setValue(horizontal)
         self.update_active_count()
         self.update_details()
+
+    def create_row_controls(self, row: int, task: TaskDefinition):
+        container = QWidget()
+        container.setObjectName("rowControls")
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(3, 3, 3, 3)
+        layout.setSpacing(3)
+        play = QToolButton()
+        play.setObjectName("runTaskButton")
+        play.setText("▶")
+        play.setToolTip(f"Запустить «{task.name}»")
+        play.setAccessibleName(f"Запустить {task.name}")
+        play.clicked.connect(lambda _checked=False, task_id=task.id: self.run_task_by_id(task_id))
+        stop = QToolButton()
+        stop.setObjectName("stopTaskButton")
+        stop.setText("■")
+        stop.setToolTip(f"Остановить «{task.name}»")
+        stop.setAccessibleName(f"Остановить {task.name}")
+        stop.clicked.connect(lambda _checked=False, task_id=task.id: self.stop_task_by_id(task_id))
+        enabled = QCheckBox()
+        enabled.setObjectName("enableTaskCheck")
+        enabled.setChecked(task.enabled)
+        enabled.setToolTip("Включить задачу для запуска по расписанию. Ручной запуск доступен всегда.")
+        enabled.setAccessibleName(f"Включить задачу {task.name}")
+        enabled.toggled.connect(lambda value, task_id=task.id: self.set_task_enabled(task_id, value))
+        layout.addWidget(play)
+        layout.addWidget(stop)
+        layout.addStretch()
+        layout.addWidget(enabled)
+        self.table.setCellWidget(row, 7, container)
+        self._row_controls[task.id] = (play, stop, enabled)
+        self.update_row_state(task)
+
+    def create_row_state(self, row: int, task: TaskDefinition):
+        container = QWidget()
+        container.setObjectName("taskStatus")
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(3)
+        label = QLabel()
+        label.setTextFormat(Qt.TextFormat.PlainText)
+        bar = QProgressBar()
+        bar.setObjectName("rowProgress")
+        bar.setTextVisible(False)
+        bar.setFixedHeight(5)
+        layout.addWidget(label)
+        layout.addWidget(bar)
+        self.table.setCellWidget(row, 4, container)
+        self._row_states[task.id] = (container, label, bar, self.table.item(row, 4))
+        self.update_row_state(task)
+
+    def update_row_state(self, task: TaskDefinition):
+        active = self.runner.is_active(task.id)
+        stopping = self.runtime_status.get(task.id) == "stopping"
+        if task.id in self._row_controls:
+            play, stop, _enabled = self._row_controls[task.id]
+            play.setEnabled(not active)
+            stop.setEnabled(active and not stopping)
+        if task.id not in self._row_states:
+            return
+        container, label, bar, item = self._row_states[task.id]
+        status = self._task_status(task)
+        progress = self.task_progress.get(task.id)
+        signature = (status, progress, self.runtime_messages.get(task.id, ""))
+        if self._row_signatures.get(task.id) == signature:
+            return
+        self._row_signatures[task.id] = signature
+        text = STATUS_LABELS.get(status, status)
+        if progress is not None:
+            value, step = progress
+            text += f" · {value}%"
+            bar.setValue(value)
+        else:
+            step = self.runtime_messages.get(task.id, "")
+        label.setText(text)
+        label.setStyleSheet(f"color: {STATUS_COLORS.get(status, '#e8edf2')}; background: transparent;")
+        bar.setVisible(progress is not None)
+        container.setToolTip(step or text)
+        if item.text() != text:
+            item.setText(text)
+            item.setForeground(QColor(STATUS_COLORS.get(status, "#ffffff")))
+
+    def refresh_runtime_cells(self):
+        for task in self.config.tasks:
+            self.update_row_state(task)
+        self.update_active_count()
+        self.apply_filters()
+
+    def run_task_by_id(self, task_id: str):
+        task = self.task_by_id(task_id)
+        if task and not self.runner.is_active(task_id):
+            self.start_task(task, foreground=True)
+
+    def stop_task_by_id(self, task_id: str):
+        task = self.task_by_id(task_id)
+        if task and self.runner.cancel(task_id):
+            self.runtime_status[task_id] = "stopping"
+            self.runtime_messages[task_id] = "Получена команда остановки"
+            self.refresh_runtime_cells()
+            self.statusBar().showMessage(f"Останавливаю «{task.name}»…", 5000)
+
+    def set_task_enabled(self, task_id: str, value: bool):
+        task = self.task_by_id(task_id)
+        if task is None:
+            return
+        old_value = task.enabled
+        task.enabled = value
+        try:
+            save_config(self.config)
+        except OSError as exc:
+            task.enabled = old_value
+            self.statusBar().showMessage(f"Не удалось сохранить задачу: {exc}", 8000)
+        self.refresh_table()
+
+    def sort_requested(self, column: int):
+        if column < 7 and not self.table.isSortingEnabled():
+            self.table.setSortingEnabled(True)
+            self.table.sortItems(column, Qt.SortOrder.AscendingOrder)
+
+    def reset_filters(self):
+        self.search.clear()
+        self.category_filter.setCurrentIndex(0)
+        self.status_filter.setCurrentIndex(0)
+        self.apply_filters()
 
     def apply_filters(self):
         query = self.search.text().strip().lower()
@@ -425,15 +669,21 @@ class MainWindow(QMainWindow):
                 visible = bool(spec and spec.category == category)
             if visible and status_filter:
                 status = self._task_status(task)
-                visible = status in {"ready", "success"} if status_filter == "ready" else status == status_filter
+                visible = status == status_filter
             self.table.setRowHidden(row, not visible)
+        visible_count = sum(not self.table.isRowHidden(row) for row in range(self.table.rowCount()))
+        self.empty_label.setText("По выбранным фильтрам задач нет." if self.config.tasks else "Задач пока нет. Нажмите «Добавить», чтобы создать первую.")
+        self.empty_label.setVisible(visible_count == 0)
+        if any(self.table.isRowHidden(index.row()) for index in self.table.selectionModel().selectedRows()):
+            self.table.clearSelection()
+        self.update_details()
 
     def task_by_id(self, task_id: str) -> TaskDefinition | None:
-        return next((task for task in self.config.tasks if task.id == task_id), None)
+        return self._tasks_by_id.get(task_id)
 
     def selected_task(self) -> TaskDefinition | None:
         rows = self.table.selectionModel().selectedRows()
-        if not rows:
+        if not rows or self.table.isRowHidden(rows[0].row()):
             return None
         item = self.table.item(rows[0].row(), 0)
         return (
@@ -464,7 +714,8 @@ class MainWindow(QMainWindow):
         for widget in (self.edit_button, self.test_button, self.open_button):
             widget.setEnabled(enabled)
         self.test_button.setEnabled(bool(task and not self.path_checks))
-        self.run_action.setEnabled(enabled)
+        active = bool(task and self.runner.is_active(task.id))
+        self.run_action.setEnabled(enabled and not active)
         self.stop_action.setEnabled(
             bool(
                 task
@@ -474,15 +725,31 @@ class MainWindow(QMainWindow):
         )
         self.schedule_action.setEnabled(enabled)
         self.edit_action.setEnabled(enabled)
-        self.delete_action.setEnabled(enabled)
+        self.delete_action.setEnabled(enabled and not active)
+        self.task_history_button.setEnabled(enabled)
+        last = self._history_cache.get(task.id) if task else None
+        self.log_button.setEnabled(bool(last and last.log_path))
         self._update_progress()
         if not task:
+            self.detail_title.setText("Выберите задачу в списке")
+            for label in (self.detail_state, self.detail_last_run, self.detail_next_run, self.detail_message):
+                label.setText("—")
             self.detail_module.setText("—")
             self.detail_source.clear()
             self.detail_output.clear()
             self.detail_schedule.setText("—")
             return
         spec = MODULES.get(task.module)
+        self.detail_title.setText(task.name)
+        status = self._task_status(task)
+        self.detail_state.setText(STATUS_LABELS.get(status, status))
+        self.detail_state.setStyleSheet(f"color: {STATUS_COLORS.get(status, '#e8edf2')};")
+        timezone = str(self.config.settings.get("timezone", "Europe/Moscow"))
+        self.detail_last_run.setText(format_history_time(last.finished_at or last.started_at, timezone) if last else "Ещё не запускалась")
+        self.detail_next_run.setText(self._format_dt(next_run(task.schedule, self._scheduler_now())) if task.enabled else "Задача отключена")
+        message = self.runtime_messages.get(task.id) or (last.message if last else "")
+        self.detail_message.setText(message or "—")
+        self.detail_message.setToolTip(message)
         self.detail_module.setText(f"{spec.category} — {spec.title}" if spec else task.module)
         self.detail_source.setText(
             task.workdir if task.module == "external" else self._primary_path(task)
@@ -597,11 +864,8 @@ class MainWindow(QMainWindow):
 
     def stop_selected(self):
         task = self.selected_task()
-        if task and self.runner.cancel(task.id):
-            self.runtime_status[task.id] = "stopping"
-            self.runtime_messages[task.id] = "Получена команда остановки"
-            self.refresh_table(task.id)
-            self.statusBar().showMessage(f"Останавливаю «{task.name}»…", 5000)
+        if task:
+            self.stop_task_by_id(task.id)
 
     def on_task_log(self, task_id: str, text: str):
         task = self.task_by_id(task_id)
@@ -610,16 +874,22 @@ class MainWindow(QMainWindow):
 
     def on_task_progress(self, task_id: str, value: int, text: str):
         self.task_progress[task_id] = (value, text)
+        task = self.task_by_id(task_id)
+        if task:
+            self.update_row_state(task)
         self._update_progress()
 
     def _update_progress(self):
         task = self.selected_task()
         progress = self.task_progress.get(task.id) if task else None
         self.progress.setVisible(progress is not None)
+        self.detail_progress.setVisible(progress is not None)
+        self.detail_step.setText(progress[1] or "Подготовка…" if progress else "—")
         if progress is not None:
             value, text = progress
+            self.detail_progress.setValue(value)
             self.progress.setValue(value)
-            self.progress.setFormat(f"{value}%  {text[:35]}")
+            self.progress.setFormat(f"{value}%")
 
     def on_task_done(self, result: RunResult):
         self.runtime_status[result.task_id] = result.status
@@ -640,6 +910,7 @@ class MainWindow(QMainWindow):
     def check_scheduler(self):
         if not self.scheduler_enabled:
             return
+        self._history_cache = self.history.latest_by_task()
         now = self._scheduler_now()
         for task in self.config.tasks:
             if not task.enabled or self.runner.is_active(task.id):
@@ -653,7 +924,7 @@ class MainWindow(QMainWindow):
                 self.catch_up_checked.add(task.id)
                 if task.schedule.catch_up:
                     previous = previous_run(task.schedule, now)
-                    last = self.history.last_for_task(task.id)
+                    last = self._history_cache.get(task.id)
                     last_value = None
                     if last:
                         try:
@@ -675,30 +946,75 @@ class MainWindow(QMainWindow):
 
     def refresh_next_run_cells(self):
         now = self._scheduler_now()
-        for row in range(self.table.rowCount()):
-            task = self.task_by_id(
-                str(self.table.item(row, 0).data(Qt.ItemDataRole.UserRole))
-            )
+        # Updating a sorted column can move rows; hold item identities first.
+        cells = [(str(self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)), self.table.item(row, 6))
+                 for row in range(self.table.rowCount())]
+        for task_id, next_item in cells:
+            task = self.task_by_id(task_id)
             if not task:
                 continue
             upcoming = next_run(task.schedule, now) if task.enabled else None
-            self.table.item(row, 6).setText(self._format_dt(upcoming))
+            next_item.setText(self._format_dt(upcoming))
             # The scheduler checks every 10s. Refresh status here too, so a
             # task that succeeded yesterday becomes Waiting after midnight.
-            current_status = self._task_status(task)
-            status_item = self.table.item(row, 4)
-            if status_item is not None:
-                status_item.setText("●  " + STATUS_LABELS.get(current_status, current_status))
-                status_item.setForeground(QColor(STATUS_COLORS.get(current_status, "#ffffff")))
+            self.update_row_state(task)
         self.apply_filters()
 
     def update_active_count(self):
-        running = len(self.runner.running_ids())
+        active = self.runner.running_ids()
+        running = sum(self.runner.is_running(task_id) for task_id in active)
+        queued = len(active) - running
         enabled = sum(1 for task in self.config.tasks if task.enabled)
-        self.active_label.setText(f"Активных задач: {enabled}   Выполняется: {running}")
+        errors = sum(self._task_status(task) == "error" for task in self.config.tasks)
+        self.active_label.setText(f"Выполняется: {running}   В очереди: {queued}")
+        self.summary_label.setText(f"Всего: {len(self.config.tasks)}   ·   Включено: {enabled}   ·   Ошибок: {errors}")
 
     def show_history(self):
-        HistoryDialog(self.history.recent(), self).exec()
+        task = self.selected_task()
+        HistoryDialog(self.history, self, task_id=task.id if task else None,
+                      task_names={task.id: task.name for task in self.config.tasks},
+                      timezone=str(self.config.settings.get("timezone", "Europe/Moscow"))).exec()
+
+    def open_selected_log(self):
+        task = self.selected_task()
+        record = self._history_cache.get(task.id) if task else None
+        if not record or not record.log_path:
+            return
+        path = Path(record.log_path)
+        if not path.is_file():
+            QMessageBox.warning(self, "Журнал недоступен", f"Файл журнала не найден:\n{path}")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.absolute()))):
+            QMessageBox.warning(self, "Журнал недоступен", "Не удалось открыть журнал в приложении по умолчанию.")
+
+    def restore_view(self):
+        state = load_view_state(self.view_state_path)
+        for key, restore in (("geometry", self.restoreGeometry),
+                             ("header", self.table.horizontalHeader().restoreState),
+                             ("splitter", self.splitter.restoreState)):
+            if state.get(key):
+                restore(QByteArray.fromBase64(state[key].encode("ascii")))
+        column = state.get("sort_column", 0)
+        order = state.get("sort_order", 0)
+        if state.get("sort_enabled") and 0 <= column < 7 and order in (0, 1):
+            self.table.setSortingEnabled(True)
+            self.table.sortItems(column, Qt.SortOrder(order))
+
+    def save_view(self):
+        header = self.table.horizontalHeader()
+        state = {
+            "version": 1,
+            "geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
+            "header": bytes(header.saveState().toBase64()).decode("ascii"),
+            "splitter": bytes(self.splitter.saveState().toBase64()).decode("ascii"),
+            "sort_enabled": self.table.isSortingEnabled(),
+            "sort_column": header.sortIndicatorSection(),
+            "sort_order": header.sortIndicatorOrder().value,
+        }
+        try:
+            save_view_state(state, self.view_state_path)
+        except OSError as exc:
+            self.statusBar().showMessage(f"Не удалось сохранить вид окна: {exc}", 5000)
 
     def show_settings(self):
         dialog = SettingsDialog(
@@ -818,10 +1134,12 @@ class MainWindow(QMainWindow):
             for task_id in self.runner.running_ids():
                 self.runner.cancel(task_id)
         self.force_exit = True
+        self.save_view()
         self.tray.hide()
         QApplication.instance().quit()
 
     def closeEvent(self, event: QCloseEvent):
+        self.save_view()
         if self.force_exit or not bool(self.config.settings.get("close_to_tray", True)):
             event.accept()
             return

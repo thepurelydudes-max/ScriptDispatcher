@@ -66,7 +66,7 @@ class UiRegressionTests(unittest.TestCase):
         with patch.object(MainWindow, "create_tray", lambda window: setattr(window, "tray", Mock())), patch(
             "dispatcher.ui.main_window.QTimer.singleShot"
         ):
-            window = MainWindow(config, {}, self.history)
+            window = MainWindow(config, {}, self.history, view_state_path=Path(self.temp.name) / "view.json")
         window.scheduler_enabled = False
         window.scheduler_timer.stop()
         self.windows.append(window)
@@ -113,7 +113,7 @@ class UiRegressionTests(unittest.TestCase):
                     dialog.close()
                     dialog.deleteLater()
 
-    def test_completed_filter_includes_success_and_manual_ready(self):
+    def test_ready_and_completed_filters_are_distinct(self):
         ready = self.task("ready")
         success = self.task("success", schedule=ScheduleConfig(mode="times", times=["12:00"]))
         self.history_record(success, "2026-10-29T12:00:00+03:00")
@@ -122,6 +122,11 @@ class UiRegressionTests(unittest.TestCase):
             window.status_filter.setCurrentIndex(window.status_filter.findData("ready"))
             window.apply_filters()
         self.assertFalse(window.table.isRowHidden(0))
+        self.assertTrue(window.table.isRowHidden(1))
+        with patch.object(window, "_scheduler_now", return_value=datetime(2026, 10, 29, 12, 30)):
+            window.status_filter.setCurrentIndex(window.status_filter.findData("success"))
+            window.apply_filters()
+        self.assertTrue(window.table.isRowHidden(0))
         self.assertFalse(window.table.isRowHidden(1))
 
     def test_background_start_keeps_selection_and_tab(self):
