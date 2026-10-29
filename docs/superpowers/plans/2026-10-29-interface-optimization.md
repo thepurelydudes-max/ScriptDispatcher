@@ -63,3 +63,9 @@
 
 - Baseline f07dc3c; user expressly requested the listed interface optimization.
 - Decision: keep existing table; do not redesign navigation or change production scheduling. Independent history/persistence tasks run in parallel with main-window work.
+- History: 12 focused tests pass for filters before LIMIT, scheduler-zone dates, old timestamps, explicit local-log action and batched latest records.
+- Persistence: 12 focused tests pass, including corruption/limits and preserving unrelated data.
+- Main window: initially 7 expected regressions failed before implementation, then all 8 new tests passed. Actual screenshots at 1500x900 and 1100x700 were inspected and the duplicate status paint corrected.
+- Whole-suite pre-review verification: 148 run, 145 passed, 3 native Windows checks skipped; compile and GUI/FFmpeg smoke passed.
+- Independent review: P2 background refresh clears selected path text; reproduced RED and corrected by avoiding identical QLineEdit.setText. Defensive refresh-error cleanup also reproduced RED and fixed with unconditional sorting/signal restoration. Main interface tests now 10/10.
+- User additionally requested Windows build on GitHub. Preview .1 at adfd7ac started the existing tag-triggered workflow; native Windows tests failed before packaging. Detailed anonymous logs are unavailable, so the workflow now emits real test tracebacks as public job annotations and a step summary while retaining failure status. No tests are skipped or disabled to build.

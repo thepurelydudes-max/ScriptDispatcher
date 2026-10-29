@@ -338,13 +338,15 @@ class MainWindow(QMainWindow):
         self.detail_form.addRow(self.detail_title)
         state_row = QHBoxLayout()
         state_row.addWidget(self.detail_state)
-        state_row.addWidget(QLabel("·"))
+        state_row.addWidget(QLabel("  ·  "))
+        state_row.setSpacing(8)
         state_row.addWidget(self.detail_module, 1)
         self.detail_form.addRow("Состояние:", state_row)
         self.detail_form.addRow("Источник:", self.detail_source)
         self.detail_form.addRow("Папка результатов:", self.detail_output)
         self.detail_form.addRow("Расписание:", self.detail_schedule)
         times_row = QHBoxLayout()
+        times_row.setSpacing(8)
         times_row.addWidget(QLabel("Последний:"))
         times_row.addWidget(self.detail_last_run)
         times_row.addSpacing(18)
@@ -479,46 +481,43 @@ class MainWindow(QMainWindow):
         horizontal = self.table.horizontalScrollBar().value()
         sorting = self.table.isSortingEnabled()
         self.table.setSortingEnabled(False)
-        self.table.blockSignals(True)
+        signals_blocked = self.table.blockSignals(True)
         self._row_controls.clear()
         self._row_states.clear()
         self._row_signatures.clear()
-        self.table.setRowCount(0)
-        for task in self.config.tasks:
-            spec = MODULES.get(task.module)
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-            last = self._history_cache.get(task.id)
-            last_text = format_history_time(last.finished_at or last.started_at, str(self.config.settings.get("timezone", "Europe/Moscow"))) if last else "—"
-            upcoming = next_run(task.schedule, self._scheduler_now())
-            status = self._task_status(task)
-            values = [
-                task.name,
-                spec.category if spec else task.module,
-                (
-                    task.workdir
-                    if task.module == "external"
-                    else self._primary_path(task)
-                )
-                or "—",
-                schedule_summary(task.schedule),
-                "●  " + STATUS_LABELS.get(status, status),
-                last_text,
-                self._format_dt(upcoming) if task.enabled else "—",
-            ]
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if column == 0:
-                    item.setData(Qt.ItemDataRole.UserRole, task.id)
-                if column == 4:
-                    item.setForeground(QColor(STATUS_COLORS.get(status, "#ffffff")))
-                item.setToolTip(value)
-                self.table.setItem(row, column, item)
-            self.table.setItem(row, 7, QTableWidgetItem(""))
-            self.create_row_controls(row, task)
-            self.create_row_state(row, task)
-        self.table.setSortingEnabled(sorting)
-        self.table.blockSignals(False)
+        try:
+            self.table.setRowCount(0)
+            for task in self.config.tasks:
+                spec = MODULES.get(task.module)
+                row = self.table.rowCount()
+                last = self._history_cache.get(task.id)
+                last_text = format_history_time(last.finished_at or last.started_at, str(self.config.settings.get("timezone", "Europe/Moscow"))) if last else "—"
+                upcoming = next_run(task.schedule, self._scheduler_now())
+                status = self._task_status(task)
+                values = [
+                    task.name,
+                    spec.category if spec else task.module,
+                    (task.workdir if task.module == "external" else self._primary_path(task)) or "—",
+                    schedule_summary(task.schedule),
+                    "●  " + STATUS_LABELS.get(status, status),
+                    last_text,
+                    self._format_dt(upcoming) if task.enabled else "—",
+                ]
+                self.table.insertRow(row)
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    if column == 0:
+                        item.setData(Qt.ItemDataRole.UserRole, task.id)
+                    if column == 4:
+                        item.setForeground(QColor(STATUS_COLORS.get(status, "#ffffff")))
+                    item.setToolTip(value)
+                    self.table.setItem(row, column, item)
+                self.table.setItem(row, 7, QTableWidgetItem(""))
+                self.create_row_controls(row, task)
+                self.create_row_state(row, task)
+        finally:
+            self.table.setSortingEnabled(sorting)
+            self.table.blockSignals(signals_blocked)
         for row in range(self.table.rowCount()):
             if self.table.item(row, 0).data(Qt.ItemDataRole.UserRole) == preserve_id:
                 self.table.selectRow(row)
@@ -537,7 +536,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(3)
         play = QToolButton()
         play.setObjectName("runTaskButton")
-        play.setText("▶")
+        play.setText("▶\ufe0e")
         play.setToolTip(f"Запустить «{task.name}»")
         play.setAccessibleName(f"Запустить {task.name}")
         play.clicked.connect(lambda _checked=False, task_id=task.id: self.run_task_by_id(task_id))
@@ -751,10 +750,13 @@ class MainWindow(QMainWindow):
         self.detail_message.setText(message or "—")
         self.detail_message.setToolTip(message)
         self.detail_module.setText(f"{spec.category} — {spec.title}" if spec else task.module)
-        self.detail_source.setText(
-            task.workdir if task.module == "external" else self._primary_path(task)
-        )
-        self.detail_output.setText(self._output_path(task))
+        source = task.workdir if task.module == "external" else self._primary_path(task)
+        output = self._output_path(task)
+        # Even an identical QLineEdit.setText resets the cursor/selection.
+        if self.detail_source.text() != source:
+            self.detail_source.setText(source)
+        if self.detail_output.text() != output:
+            self.detail_output.setText(output)
         self.detail_schedule.setText(schedule_summary(task.schedule))
 
     def add_task(self):

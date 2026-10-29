@@ -127,6 +127,28 @@ class InterfaceOptimizationTests(unittest.TestCase):
         self.assertIsNone(window.selected_task())
         self.assertFalse(window.run_action.isEnabled())
 
+    def test_background_refresh_preserves_selected_path_text(self):
+        task = TaskDefinition(id="path", name="Path", module="external", enabled=True, workdir="abcdef")
+        window = self.window([task])
+        window.table.selectRow(0)
+        window.detail_source.setSelection(1, 3)
+        self.assertEqual(window.detail_source.selectedText(), "bcd")
+        window.refresh_runtime_cells()
+        self.assertEqual(window.detail_source.selectedText(), "bcd")
+
+    def test_refresh_error_restores_signals_and_sorting(self):
+        window = self.window()
+        window.table.setSortingEnabled(True)
+        task = window.config.tasks[0]
+        task.schedule.mode = "times"
+        task.schedule.times = ["invalid"]
+        with self.assertRaises(ValueError):
+            window.refresh_table()
+        self.assertFalse(window.table.signalsBlocked())
+        self.assertTrue(window.table.isSortingEnabled())
+        task.schedule.times = ["12:00"]
+        window.refresh_table()
+
     def test_view_roundtrip_preserves_width_sort_and_splitter(self):
         first = self.window()
         self.assertTrue(hasattr(first, "splitter"))
